@@ -32,7 +32,9 @@ public class ContentStore {
     private final Path rootDir;
     private final long maxBytes;
     private final Map<String, Integer> refCounts = new ConcurrentHashMap<>();
+    private final Map<String, Long> blobSizes = new ConcurrentHashMap<>();
     private long usedBytes;
+    private long dedupSavedBytes;
 
     public ContentStore(@Value("${storage.root:data/content}") String rootDir,
                         @Value("${storage.capacity-bytes:67108864}") long maxBytes) {
@@ -83,9 +85,11 @@ public class ContentStore {
                 throw new UncheckedIOException("failed to store content " + hash, e);
             }
             usedBytes += content.length;
+            blobSizes.put(hash, (long) content.length);
             log.info("[ContentStore.store] hash={} stored new blob size={} used={}", hash, content.length, usedBytes);
         } else {
-            log.info("[ContentStore.store] hash={} dedup hit, reuse existing blob", hash);
+            dedupSavedBytes += content.length;
+            log.info("[ContentStore.store] hash={} dedup hit, reuse existing blob, dedupSaved={}", hash, dedupSavedBytes);
         }
         int rc = refCounts.merge(hash, 1, Integer::sum);
         log.info("[ContentStore.store] hash={} refCount -> {}", hash, rc);
@@ -140,6 +144,7 @@ public class ContentStore {
                 long size = Files.exists(path) ? Files.size(path) : 0;
                 Files.deleteIfExists(path);
                 usedBytes -= size;
+                blobSizes.remove(contentHash);
                 log.info("[ContentStore.release] hash={} refCount -> 0, blob reclaimed, used={}", contentHash, usedBytes);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
@@ -165,5 +170,39 @@ public class ContentStore {
 
     public synchronized long usedBytes() {
         return usedBytes;
+    }
+
+    /** 指定内容哈希落盘占用的字节数；不存在返回 0。 */
+    public synchronized long sizeOf(String contentHash) {
+        return blobSizes.getOrDefault(contentHash, 0L);
+    }
+
+    /** 累计因去重命中而省下的字节数（重复写入未重复占用的容量）。 */
+    public synchronized long dedupSavedBytes() {
+        return dedupSavedBytes;
+    }
+
+    /** 容量上限。 */
+    public long capacityBytes() {
+        return maxBytes;
+    }
+
+    /**
+     * 实际扫描落盘目录得到的字节数（仅 .blob 文件）。
+     * 用于统计口径校验：内存中的 usedBytes 必须与磁盘实际占用一致。
+     */
+    public synchronized long diskUsedBytes() {
+        try (var stream = Files.list(rootDir)) {
+            return stream.filter(p -> p.getFileName().toString().endsWith(".blob"))
+                    .mapToLong(p -> {
+                        try {
+                            return Files.size(p);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    }).sum();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 }

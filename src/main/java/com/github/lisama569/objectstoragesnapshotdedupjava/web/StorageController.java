@@ -3,6 +3,8 @@ package com.github.lisama569.objectstoragesnapshotdedupjava.web;
 import com.github.lisama569.objectstoragesnapshotdedupjava.exception.ErrorCode;
 import com.github.lisama569.objectstoragesnapshotdedupjava.exception.StorageException;
 import com.github.lisama569.objectstoragesnapshotdedupjava.model.ObjectMeta;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.SnapshotMeta;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.StorageStats;
 import com.github.lisama569.objectstoragesnapshotdedupjava.service.ObjectStorageService;
 import com.github.lisama569.objectstoragesnapshotdedupjava.service.SnapshotService;
 import org.springframework.http.HttpStatus;
@@ -52,8 +54,25 @@ public class StorageController {
     }
 
     @PostMapping("/snapshots/{name}")
-    public String createSnapshot(@PathVariable String name) {
-        return snapshotService.createSnapshot(name);
+    public String createSnapshot(@PathVariable String name,
+                                 @RequestParam(required = false) Integer maxSnapshots,
+                                 @RequestParam(required = false) Long maxAgeMillis) {
+        return snapshotService.createSnapshot(name, maxSnapshots, maxAgeMillis);
+    }
+
+    @DeleteMapping("/snapshots/{name}")
+    public void deleteSnapshot(@PathVariable String name) {
+        snapshotService.deleteSnapshot(name);
+    }
+
+    @GetMapping("/snapshots")
+    public List<SnapshotMeta> snapshotStats() {
+        return snapshotService.snapshotStats();
+    }
+
+    @GetMapping("/stats")
+    public StorageStats storageStats() {
+        return snapshotService.storageStats();
     }
 
     @GetMapping("/snapshots/{name}/objects/{object}")
@@ -70,9 +89,10 @@ public class StorageController {
     public ResponseEntity<Map<String, String>> handle(StorageException e) {
         HttpStatus status = switch (e.getErrorCode()) {
             case CONTENT_CORRUPTED -> HttpStatus.UNPROCESSABLE_ENTITY;
-            case CONCURRENT_CONFLICT -> HttpStatus.CONFLICT;
+            case CONCURRENT_CONFLICT, SNAPSHOT_IN_USE -> HttpStatus.CONFLICT;
             case CAPACITY_EXCEEDED -> HttpStatus.INSUFFICIENT_STORAGE;
             case OBJECT_NOT_FOUND, SNAPSHOT_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case SNAPSHOT_EVICTED -> HttpStatus.GONE;
             case RESTORE_FAILED -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
         return ResponseEntity.status(status)
