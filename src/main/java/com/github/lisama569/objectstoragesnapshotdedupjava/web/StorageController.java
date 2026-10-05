@@ -3,6 +3,11 @@ package com.github.lisama569.objectstoragesnapshotdedupjava.web;
 import com.github.lisama569.objectstoragesnapshotdedupjava.exception.ErrorCode;
 import com.github.lisama569.objectstoragesnapshotdedupjava.exception.StorageException;
 import com.github.lisama569.objectstoragesnapshotdedupjava.model.ObjectMeta;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.RetentionPolicy;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.SnapshotCreateResult;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.SnapshotDeleteResult;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.SnapshotInfo;
+import com.github.lisama569.objectstoragesnapshotdedupjava.model.SpaceStats;
 import com.github.lisama569.objectstoragesnapshotdedupjava.service.ObjectStorageService;
 import com.github.lisama569.objectstoragesnapshotdedupjava.service.SnapshotService;
 import org.springframework.http.HttpStatus;
@@ -13,7 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * REST 入口：对象读写删、快照与恢复。错误码映射为可区分的 HTTP 状态。
+ * REST 入口：对象读写删、快照生命周期（创建/删除/列表/恢复）、容量统计。
+ * 错误码映射为可区分的 HTTP 状态。
  */
 @RestController
 @RequestMapping("/api")
@@ -52,8 +58,25 @@ public class StorageController {
     }
 
     @PostMapping("/snapshots/{name}")
-    public String createSnapshot(@PathVariable String name) {
-        return snapshotService.createSnapshot(name);
+    public SnapshotCreateResult createSnapshot(@PathVariable String name,
+                                               @RequestParam(required = false) Integer maxCount,
+                                               @RequestParam(required = false) Long maxAgeMillis) {
+        return snapshotService.createSnapshot(name, new RetentionPolicy(maxCount, maxAgeMillis));
+    }
+
+    @DeleteMapping("/snapshots/{name}")
+    public SnapshotDeleteResult deleteSnapshot(@PathVariable String name) {
+        return snapshotService.deleteSnapshot(name);
+    }
+
+    @GetMapping("/snapshots")
+    public List<SnapshotInfo> listSnapshots() {
+        return snapshotService.listSnapshotDetails();
+    }
+
+    @GetMapping("/stats")
+    public SpaceStats stats() {
+        return snapshotService.stats();
     }
 
     @GetMapping("/snapshots/{name}/objects/{object}")
@@ -74,6 +97,7 @@ public class StorageController {
             case CAPACITY_EXCEEDED -> HttpStatus.INSUFFICIENT_STORAGE;
             case OBJECT_NOT_FOUND, SNAPSHOT_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case RESTORE_FAILED -> HttpStatus.INTERNAL_SERVER_ERROR;
+            case INVALID_RETENTION -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status)
                 .body(Map.of("errorCode", e.getErrorCode().name(), "message", e.getMessage()));

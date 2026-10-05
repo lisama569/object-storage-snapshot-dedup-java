@@ -15,5 +15,7 @@ public enum ErrorCode {
     /** 快照不存在 */
     SNAPSHOT_NOT_FOUND,
     /** 恢复失败（已回滚，无部分恢复结果） */
-    RESTORE_FAILED
+    RESTORE_FAILED,
+    /** 保留策略参数非法（份数/时长 <= 0） */
+    INVALID_RETENTION
 }

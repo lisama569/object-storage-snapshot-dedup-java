@@ -13,6 +13,7 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -126,8 +127,8 @@ public class ContentStore {
         log.info("[ContentStore.addRef] hash={} refCount -> {}", contentHash, rc);
     }
 
-    /** 减少引用计数；归零时回收底层数据。 */
-    public synchronized void release(String contentHash) {
+    /** 减少引用计数；归零时回收底层数据。返回本次实际回收的字节数（未归零则为 0）。 */
+    public synchronized long release(String contentHash) {
         Integer rc = refCounts.get(contentHash);
         if (rc == null || rc <= 0) {
             throw new StorageException(ErrorCode.CONTENT_CORRUPTED,
@@ -141,12 +142,14 @@ public class ContentStore {
                 Files.deleteIfExists(path);
                 usedBytes -= size;
                 log.info("[ContentStore.release] hash={} refCount -> 0, blob reclaimed, used={}", contentHash, usedBytes);
+                return size;
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
         } else {
             refCounts.put(contentHash, rc - 1);
             log.info("[ContentStore.release] hash={} refCount -> {}", contentHash, rc - 1);
+            return 0;
         }
     }
 
@@ -165,5 +168,28 @@ public class ContentStore {
 
     public synchronized long usedBytes() {
         return usedBytes;
+    }
+
+    /**
+     * 物理状态的一致视图：已用容量与每个现存 blob 的物理大小。
+     * 与引用计数变更在同一监视器下获取，统计口径以磁盘上真实落盘的数据为准
+     * （遍历 {@code *.blob}），保证“统计 == 磁盘实际”。
+     */
+    public synchronized PhysicalView physicalView() {
+        Map<String, Long> sizes = new HashMap<>();
+        long total = 0;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(rootDir, "*.blob")) {
+            for (Path p : stream) {
+                long size = Files.size(p);
+                String fileName = p.getFileName().toString();
+                String hash = fileName.substring(0, fileName.length() - ".blob".length());
+                sizes.put(hash, size);
+                total += size;
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        // 以磁盘真实总量为准（正常情况下与 usedBytes 一致）。
+        return new PhysicalView(total, sizes);
     }
 }
