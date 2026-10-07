@@ -204,21 +204,35 @@ public class SnapshotService {
         return new ArrayList<>(snapshots.keySet());
     }
 
-    /** 快照列表及每份的空间占用口径（referenced / exclusive）。 */
+    /**
+     * 快照列表及每份的空间占用口径（referenced / exclusive）。
+     *
+     * 独占判定口径（与删除时的实际回收逐字节一致）：
+     *  - 先统计“这份快照自己”对每个内容哈希持有的引用数 myRefs（同一份快照中
+     *    多个对象指向同一内容时，该哈希在该快照内就有多条引用，去重落盘但引用不合并）；
+     *  - 取 ContentStore 同一瞬间的全局引用计数快照 globalRefs；
+     *  - 当且仅当 myRefs.get(h) == globalRefs.get(h) 时，该内容的全部引用都由这份快照持有
+     *    （当前对象与任何其它快照都不再引用它），删除它才会把计数释放到 0 并真正回收；
+     *  - 每份独占内容只按一份 blob 大小计入 exclusiveBytes（落盘只占一份）。
+     */
     public synchronized List<SnapshotMeta> snapshotStats() {
+        Map<String, Integer> globalRefs = contentStore.refCountsSnapshot();
         List<SnapshotMeta> result = new ArrayList<>();
         for (Map.Entry<String, SnapshotEntry> e : snapshots.entrySet()) {
             SnapshotEntry entry = e.getValue();
             long referenced = 0;
             long exclusive = 0;
-            Set<String> seen = new HashSet<>();
+            // 该快照自己对每个哈希的引用数（同内容多条记录会大于 1）
+            Map<String, Integer> myRefs = new HashMap<>();
             for (ObjectMeta meta : entry.index().values()) {
-                if (seen.add(meta.contentHash())) {
-                    long size = contentStore.sizeOf(meta.contentHash());
-                    referenced += size;
-                    if (contentStore.refCount(meta.contentHash()) == 1) {
-                        exclusive += size; // 仅该快照引用，删除即可回收
-                    }
+                myRefs.merge(meta.contentHash(), 1, Integer::sum);
+            }
+            for (Map.Entry<String, Integer> mine : myRefs.entrySet()) {
+                String hash = mine.getKey();
+                long size = contentStore.sizeOf(hash);
+                referenced += size; // 去重后的不同内容各计一份 blob 大小
+                if (mine.getValue().equals(globalRefs.getOrDefault(hash, 0))) {
+                    exclusive += size; // 该快照是此内容的唯一持有者，删除即可回收
                 }
             }
             result.add(new SnapshotMeta(e.getKey(), entry.createdAtMillis(), entry.index().size(),

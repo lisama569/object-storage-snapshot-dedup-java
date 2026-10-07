@@ -43,8 +43,20 @@ exception/ErrorCode          可区分的失败原因分类
 ## 容量与回收统计口径
 
 - `GET /api/stats`：`usedBytes`（当前实际占用，与磁盘落盘一致）、`capacityBytes`（上限）、`dedupSavedBytes`（去重命中累计省下的字节数）、`snapshotCount`。
-- `GET /api/snapshots`：每份快照的 `referencedBytes`（引用的全部底层数据量，可能与他人共享）与 `exclusiveBytes`（仅被该快照引用的数据量，即**删除该快照预计能回收的空间**，口径 = 引用计数为 1 的内容大小之和）。
-- 一致性保证：所有引用计数与容量变更和文件操作在同一监视器下完成；并发写入、删除、创建/删除快照交错静止后，`usedBytes` 与实际磁盘占用（`ContentStore.diskUsedBytes()`）逐项相等，测试对此做了断言。
+- `GET /api/snapshots`：每份快照的 `referencedBytes` 与 `exclusiveBytes`。
+
+### “删除一份快照预计能回收多少”（exclusiveBytes）的统计口径
+
+删除快照时，系统对快照索引中的**每条对象记录**逐个 `release` 其内容哈希；某份内容的全局引用计数降到 0 时，对应的 blob 文件才真正删除、容量才真正下降。预计回收量必须与这条删除路径**逐字节一致**，因此按以下规则计算：
+
+1. **引用是按记录计数的，落盘是按内容去重的。** 同一份快照里若有多个对象内容相同（多个对象名指向同一哈希），它们共享一份 blob，但快照对该哈希持有**多条引用**（有几条记录就持有几个引用）。
+2. **独占判定**：对快照引用的每个内容哈希 H，先数出“这份快照自己”对 H 的引用数 `myRefs`（快照内同内容记录条数），再取 H 的**全局**引用计数 `globalRefs`（= 当前对象的引用 + 所有快照的引用之和）。当且仅当 `myRefs == globalRefs` 时，H 的全部引用都由这份快照持有——即当前对象和任何其它快照都不再引用它——删除这份快照才会把它释放到 0 并真正回收。
+   - 只要 H 还被**当前对象**或**任何其它快照**引用（哪怕只引用一次），`globalRefs > myRefs`，就不计入预计回收，删除后也确实不会回收它。
+   - 典型反例（曾出现的 bug）：两个内容相同的对象去重落盘一份，打一份快照（快照内 2 条同哈希记录），随后把两个当前对象都删掉。此时全局引用计数为 2，且这 2 个引用**全部**来自这份快照。旧实现只判断“全局计数 == 1”，于是预计回收报 0；但真删快照时会 release 两次、计数归零，实际回收了一整份内容大小，造成预计与实际不符。修复后按 `myRefs(2) == globalRefs(2)` 判定为独占，预计与实际都等于这一份 blob 的大小。
+3. **按 blob 大小计，不按记录条数翻倍。** 无论快照内同内容有多少条记录，`exclusiveBytes` 与 `referencedBytes` 对每个不同哈希都只计**一份 blob 的字节数**（磁盘上本来就只有一份）。
+4. **referencedBytes**：快照引用的所有**不同**内容哈希的 blob 大小之和（含与他人共享的部分），同样对同内容多条记录只计一次。
+5. 统计读取的是 `ContentStore` 在同一监视器下取出的引用计数一致性快照，避免并发 release 把逐哈希读数撕裂；删除/淘汰在服务层串行化，因此在操作静止后，“统计预计回收”与“删除实际释放”必然相等。删除一份快照还可能使原先与它共享的内容变成另一份快照的独占内容，后续统计会立即反映这一点。
+- 一致性保证：所有引用计数与容量变更和文件操作在同一监视器下完成；并发写入、删除、创建/删除快照交错静止后，`usedBytes` 与实际磁盘占用（`ContentStore.diskUsedBytes()`）逐项相等，且每份存活快照的 `exclusiveBytes` 与其真实删除释放量相等，测试对此做了断言。
 
 ## 完整性与错误分类
 
@@ -91,10 +103,43 @@ POST   /api/snapshots/{name}/restore        原子恢复
 mvn test
 ```
 
+### 手工复现“预计回收 == 实际回收”（同内容两条记录成为唯一持有者）
+
+启动服务（`mvn spring-boot:run`，默认端口 8080）后：
+
+```bash
+# 1) 放两个内容完全一样的对象（服务端按 SHA-256 去重，落盘一份 16 字节 blob）
+printf 'identical-payload' | curl -s -X PUT --data-binary @- http://localhost:8080/api/objects/obj-a
+printf 'identical-payload' | curl -s -X PUT --data-binary @- http://localhost:8080/api/objects/obj-b
+
+# 2) 打一份快照（快照内有两条指向同一哈希的记录）
+curl -s -X POST http://localhost:8080/api/snapshots/snap
+
+# 3) 把两个当前对象都删掉（此时该 blob 的全部引用都来自这份快照）
+curl -s -X DELETE http://localhost:8080/api/objects/obj-a
+curl -s -X DELETE http://localhost:8080/api/objects/obj-b
+
+# 4) 看快照统计：exclusiveBytes 应为 16（一份 blob 的大小），而不是 0
+curl -s http://localhost:8080/api/snapshots
+# [{"name":"snap","createdAtMillis":...,"objectCount":2,"referencedBytes":16,"exclusiveBytes":16}]
+curl -s http://localhost:8080/api/stats    # 删除前 usedBytes=16
+
+# 5) 删除快照：usedBytes 实际下降 16，与第 4 步的预计逐字节一致
+curl -s -X DELETE http://localhost:8080/api/snapshots/snap
+curl -s http://localhost:8080/api/stats    # 删除后 usedBytes=0
+```
+
+判定依据：第 4 步的 `exclusiveBytes` 必须等于第 5 步删除前后 `usedBytes` 的差值；共享内容（仍被当前对象或其它快照引用）不计入 `exclusiveBytes`，删除后也不会被回收。
+
 测试一次性覆盖并本地复现以下场景，日志中打印输入、引用计数变化与判定依据：
 
 - `ObjectStorageDedupTest`：重复写入去重与引用计数准确性；16 线程并发写同一内容（引用计数 == 线程数、仅一份数据落盘）；并发删除交错不提前回收；覆盖写释放旧内容；版本冲突拒绝且不留半写入。
 - `SnapshotServiceTest`：快照与当前数据隔离（覆盖/删除/新增均不影响快照）；恢复后当前状态与快照一致；**恢复失败回退**（篡改快照引用的 blob 后恢复抛 `RESTORE_FAILED`，当前状态逐对象比对不变）。
 - `IntegrityAndCapacityTest`：内容损坏与内容缺失均报 `CONTENT_CORRUPTED`；超限写入报 `CAPACITY_EXCEEDED` 且无容量/引用残留；去重命中不重复占用容量。
 - `SnapshotLifecycleTest`：删除快照后当前对象不受影响且仅回收独占数据；引用计数归零才回收；删除不存在的快照报 `SNAPSHOT_NOT_FOUND`；8 线程并发删除同一快照恰好成功一次、其余报 `SNAPSHOT_NOT_FOUND` 且计数无错乱；按份数/按时长保留策略淘汰最旧快照且不误伤更近快照与当前对象；被淘汰快照读/恢复/删除均报 `SNAPSHOT_EVICTED`；淘汰与手动删除最终状态一致；统计口径（referenced/exclusive/dedupSaved）与磁盘占用逐项核对；6 线程交错并发静止后 `usedBytes == diskUsedBytes` 且对象全部可读；恢复进行中删除快照报 `SNAPSHOT_IN_USE`，恢复完整完成后删除可成功。
+  - **预计回收口径专项**（本次修复重点）：
+    - `duplicateRecordsInOneSnapshotBecomingSoleHolderPredictReclaimExactly`：两个同内容对象去重后打一份快照（快照内 2 条同哈希记录），再删掉两个当前对象——该快照成为唯一持有者时 `exclusiveBytes` 等于一整份 blob 大小，且删除实际释放量逐字节相等，磁盘无残留；
+    - `exclusiveAccountingAcrossSharedSnapshotsAndCurrentObjects`：X 三方共享、Y 两个快照共享、Z 仅 s1 持有且快照内两条同内容记录、E 仅 s2 持有、W 仅当前对象的交叉矩阵，逐份验证预计==实际、共享内容不被提前回收、删一份后另一份的独占集会相应变化、当前对象始终可读可写；
+    - `retentionEvictionReclaimsExactlyPredictedExclusiveBytes`：保留策略自动淘汰的实际释放量等于淘汰前统计的 `exclusiveBytes`，与手动删除同口径；
+    - `afterConcurrentChurnEverySnapshotPredictionMatchesActualReclaim`：6 线程并发创建/删除快照并夹着对象读写，静止后逐份“现取统计→真删→核对释放量”，每份快照预计回收 == 实际回收，且 `usedBytes == diskUsedBytes`、当前对象全部可读。
 - `SnapshotApiE2ETest`：通过 HTTP 端到端验证删除快照、重复删除（404 `SNAPSHOT_NOT_FOUND`）、保留策略淘汰（410 `SNAPSHOT_EVICTED` 与 404 区分）、快照列表与容量统计、淘汰回收量体现在 `usedBytes` 上。

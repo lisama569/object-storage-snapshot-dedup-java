@@ -159,6 +159,15 @@ public class ContentStore {
         return refCounts.getOrDefault(contentHash, 0);
     }
 
+    /**
+     * 在同一监视器下取全部引用计数的不可变快照。
+     * 统计口径（预计回收量）必须基于某一瞬间的一致计数计算，
+     * 否则并发 release 可能让逐哈希读取到的计数前后撕裂，导致预计值与实际回收不一致。
+     */
+    public synchronized Map<String, Integer> refCountsSnapshot() {
+        return Map.copyOf(refCounts);
+    }
+
     public boolean exists(String contentHash) {
         return Files.exists(contentPath(contentHash));
     }
