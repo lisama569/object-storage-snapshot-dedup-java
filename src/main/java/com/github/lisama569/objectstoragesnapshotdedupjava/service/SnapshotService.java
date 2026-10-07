@@ -204,21 +204,46 @@ public class SnapshotService {
         return new ArrayList<>(snapshots.keySet());
     }
 
-    /** 快照列表及每份的空间占用口径（referenced / exclusive）。 */
+    /**
+     * 快照列表及每份的空间占用口径（referenced / exclusive）。
+     *
+     * exclusive（删除该快照预计能回收的空间）按“持有者”而非“引用计数是否为 1”判定：
+     * 同一份快照里同内容有多条记录时，该快照对它持有多条引用，引用计数大于 1，
+     * 但只要当前对象和其它快照都不引用它，删除这份快照仍会把它回收到零——必须计入。
+     * 因此判定条件为：该哈希的引用者只有这份快照自己
+     * （当前对象引用数 == 0 且其它快照引用数 == 0），与 reclaimLocked 的实际回收逐字节一致。
+     */
     public synchronized List<SnapshotMeta> snapshotStats() {
+        // 当前对象持有的引用（按内容哈希计数）。
+        Map<String, Integer> currentRefs = new HashMap<>();
+        for (ObjectMeta meta : objectStorage.currentIndex().values()) {
+            currentRefs.merge(meta.contentHash(), 1, Integer::sum);
+        }
+        // 全部快照合计持有的引用（按内容哈希计数）。
+        Map<String, Integer> allSnapshotRefs = new HashMap<>();
+        for (SnapshotEntry entry : snapshots.values()) {
+            for (ObjectMeta meta : entry.index().values()) {
+                allSnapshotRefs.merge(meta.contentHash(), 1, Integer::sum);
+            }
+        }
         List<SnapshotMeta> result = new ArrayList<>();
         for (Map.Entry<String, SnapshotEntry> e : snapshots.entrySet()) {
             SnapshotEntry entry = e.getValue();
+            // 本快照对 each 哈希持有的引用条数（同一快照内同内容可有多条记录）。
+            Map<String, Integer> ownRefs = new HashMap<>();
+            for (ObjectMeta meta : entry.index().values()) {
+                ownRefs.merge(meta.contentHash(), 1, Integer::sum);
+            }
             long referenced = 0;
             long exclusive = 0;
-            Set<String> seen = new HashSet<>();
-            for (ObjectMeta meta : entry.index().values()) {
-                if (seen.add(meta.contentHash())) {
-                    long size = contentStore.sizeOf(meta.contentHash());
-                    referenced += size;
-                    if (contentStore.refCount(meta.contentHash()) == 1) {
-                        exclusive += size; // 仅该快照引用，删除即可回收
-                    }
+            for (Map.Entry<String, Integer> own : ownRefs.entrySet()) {
+                String hash = own.getKey();
+                long size = contentStore.sizeOf(hash);
+                referenced += size;
+                int otherHolders = currentRefs.getOrDefault(hash, 0)
+                        + allSnapshotRefs.getOrDefault(hash, 0) - own.getValue();
+                if (otherHolders == 0) {
+                    exclusive += size; // 该快照是唯一持有者，删除即可回收
                 }
             }
             result.add(new SnapshotMeta(e.getKey(), entry.createdAtMillis(), entry.index().size(),

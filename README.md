@@ -43,7 +43,17 @@ exception/ErrorCode          可区分的失败原因分类
 ## 容量与回收统计口径
 
 - `GET /api/stats`：`usedBytes`（当前实际占用，与磁盘落盘一致）、`capacityBytes`（上限）、`dedupSavedBytes`（去重命中累计省下的字节数）、`snapshotCount`。
-- `GET /api/snapshots`：每份快照的 `referencedBytes`（引用的全部底层数据量，可能与他人共享）与 `exclusiveBytes`（仅被该快照引用的数据量，即**删除该快照预计能回收的空间**，口径 = 引用计数为 1 的内容大小之和）。
+- `GET /api/snapshots`：每份快照的 `referencedBytes`（引用的全部底层数据量，可能与他人共享）与 `exclusiveBytes`（仅被该快照持有的数据量，即**删除该快照预计能回收的空间**）。
+
+### “删除一份快照预计能回收多少”的统计口径
+
+`exclusiveBytes` 按**持有者**判定，而不是看引用计数是否为 1：
+
+- 一份内容的“持有者”包括：当前对象、每一份引用它的快照。同一份快照里同内容有多条记录（去重导致多个对象映射到同一哈希）时，该快照对它持有**多条引用**，引用计数大于 1，但仍只算**一个持有者**。
+- 判定规则：某内容哈希既不被任何当前对象引用、也不被任何其它快照引用（本快照是唯一持有者）时，其大小计入 `exclusiveBytes`；否则不计入。
+- 因此“同一份快照里同内容有多条记录、且该快照是唯一持有者”时，`exclusiveBytes` 仍只算**一份**底层数据的大小（去重后只有一份数据落盘），并且删除这份快照确实会把它回收到零——预计值与实际回收**逐字节一致**。
+- 反例（旧口径缺陷）：若按“引用计数 == 1”判定，上述场景引用计数为 2（同一快照的两条记录），会被误判为“非独占、预计回收 0”，但删除时逐条释放引用仍把数据回收到零，预计值与实际回收对不上。
+- 手动删除与保留策略淘汰走同一条回收路径，对同一份数据给出同样的最终状态；删除后 `usedBytes` 与实际落盘（`ContentStore.diskUsedBytes()`）一致，测试逐字节断言“预计回收 == 实际回收 == 磁盘差值”。
 - 一致性保证：所有引用计数与容量变更和文件操作在同一监视器下完成；并发写入、删除、创建/删除快照交错静止后，`usedBytes` 与实际磁盘占用（`ContentStore.diskUsedBytes()`）逐项相等，测试对此做了断言。
 
 ## 完整性与错误分类
@@ -98,3 +108,29 @@ mvn test
 - `IntegrityAndCapacityTest`：内容损坏与内容缺失均报 `CONTENT_CORRUPTED`；超限写入报 `CAPACITY_EXCEEDED` 且无容量/引用残留；去重命中不重复占用容量。
 - `SnapshotLifecycleTest`：删除快照后当前对象不受影响且仅回收独占数据；引用计数归零才回收；删除不存在的快照报 `SNAPSHOT_NOT_FOUND`；8 线程并发删除同一快照恰好成功一次、其余报 `SNAPSHOT_NOT_FOUND` 且计数无错乱；按份数/按时长保留策略淘汰最旧快照且不误伤更近快照与当前对象；被淘汰快照读/恢复/删除均报 `SNAPSHOT_EVICTED`；淘汰与手动删除最终状态一致；统计口径（referenced/exclusive/dedupSaved）与磁盘占用逐项核对；6 线程交错并发静止后 `usedBytes == diskUsedBytes` 且对象全部可读；恢复进行中删除快照报 `SNAPSHOT_IN_USE`，恢复完整完成后删除可成功。
 - `SnapshotApiE2ETest`：通过 HTTP 端到端验证删除快照、重复删除（404 `SNAPSHOT_NOT_FOUND`）、保留策略淘汰（410 `SNAPSHOT_EVICTED` 与 404 区分）、快照列表与容量统计、淘汰回收量体现在 `usedBytes` 上。
+- `SnapshotExclusiveReclaimTest`：`exclusiveBytes` 口径回归——同一快照内同内容多条记录且为唯一持有者时预计回收一整份（复现“预计 0 实际回收一整份”的缺陷场景）；内容仍被当前对象或其它快照引用时预计回收为 0 且实际零回收、当前对象照常可读写；独占/共享混合场景逐项核对；手动删除与保留策略淘汰对同一份数据最终状态一致；6 线程并发交错静止后逐份删除，每一刀都断言“预计回收 == 实际回收 == 磁盘差值”，快照清空后 `usedBytes == 当前对象去重数据量 == 磁盘占用` 且对象全部可读写。
+
+### 本地复现“预计回收 vs 实际回收”核对
+
+```bash
+# 只跑口径回归测试，日志可见每份快照的 referenced/exclusive、
+# 每次删除的 predicted/actual 与判定依据
+mvn test -Dtest=SnapshotExclusiveReclaimTest
+```
+
+手动复现（对应 `duplicateContentRecordsInOneSnapshotAreCountedAsExclusive`）：
+
+```bash
+mvn spring-boot:run &
+printf 'same-content' > /tmp/payload   # 12 字节
+H="Content-Type: application/octet-stream"
+curl -X PUT -H "$H" --data-binary @/tmp/payload localhost:8080/api/objects/o1
+curl -X PUT -H "$H" --data-binary @/tmp/payload localhost:8080/api/objects/o2   # 去重命中
+curl -X POST localhost:8080/api/snapshots/snap
+curl -X DELETE localhost:8080/api/objects/o1
+curl -X DELETE localhost:8080/api/objects/o2
+curl localhost:8080/api/snapshots    # snap 的 exclusiveBytes 应为 12（内容大小），不是 0
+curl localhost:8080/api/stats        # 记下 usedBytes（= 12）
+curl -X DELETE localhost:8080/api/snapshots/snap
+curl localhost:8080/api/stats        # usedBytes 下降量（12 -> 0）== 上面的 exclusiveBytes
+```
